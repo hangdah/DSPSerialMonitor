@@ -1,21 +1,23 @@
 function DSPSerialMonitor
-% DSPSerialMonitor  Four-channel real-time serial waveform monitor.
+% DSPSerialMonitor  Configurable-channel real-time serial waveform monitor.
 %
 % Expected DSP frame (one line per frame):
-%   value1,value2,value3,value4
+%   value1,value2,...,valueN
 % Example:
 %   48.12,75.03,8.42,7.91
 %
 % Default serial settings: COM10, 115200 baud, 8N1, no flow control.
 % Requires MATLAB R2019b or newer (serialport interface).
 
-defaultChannelNames = ["CH1", "CH2", "CH3", "CH4"];
-defaultChannelUnits = ["", "", "", ""];
-defaultYAxisExpand = true(1, 4);
-defaultYLimits = repmat([0 1], 4, 1);
-defaultChannelVisible = true(1, 4);
-defaultPlotIndex = 1:4;
+maxChannelCount = 16;
+defaultChannelCount = 4;
 defaultPlotCount = 4;
+defaultChannelNames = "CH" + string(1:maxChannelCount);
+defaultChannelUnits = strings(1, maxChannelCount);
+defaultYAxisExpand = true(1, maxChannelCount);
+defaultYLimits = repmat([0 1], maxChannelCount, 1);
+defaultChannelVisible = true(1, maxChannelCount);
+defaultPlotIndex = mod(0:(maxChannelCount - 1), defaultPlotCount) + 1;
 yExpansionMargin = 0.05;
 preferencesGroup = 'DSPSerialMonitor';
 legacyPreferencesGroup = 'BoostSerialMonitor';
@@ -30,8 +32,11 @@ plotPeriod = 0.05;         % Refresh plots at no more than 20 frames/s.
 counterPeriod = 0.2;       % Refresh counters at no more than 5 frames/s.
 maxPlotSamples = 2000;     % Limit graphics load for long time windows.
 
-uiFontName = 'Microsoft YaHei UI';
-plotFontName = 'Segoe UI';
+uiFontName = selectAvailableFont('Microsoft YaHei', ...
+    {'Microsoft YaHei UI', 'SimHei', 'Noto Sans CJK SC', ...
+    'Arial Unicode MS', 'Arial'});
+plotFontName = selectAvailableFont('Times New Roman', ...
+    {'Cambria', 'Georgia', 'Liberation Serif', 'DejaVu Serif', 'Arial'});
 windowColor = [0.945 0.957 0.973];
 cardColor = [1.000 1.000 1.000];
 borderColor = [0.820 0.850 0.900];
@@ -46,7 +51,7 @@ state.serial = [];
 state.connected = false;
 state.paused = false;
 state.time = zeros(maxStoredSamples, 1);
-state.values = zeros(maxStoredSamples, 4);
+state.values = zeros(maxStoredSamples, channelSettings.channelCount);
 state.sampleCount = 0;
 state.writeIndex = 1;
 state.goodFrames = 0;
@@ -57,6 +62,8 @@ state.lastPlotTime = -inf;
 state.lastCounterTime = -inf;
 state.closing = false;
 state.settingsFigure = [];
+state.settingsDraftData = {};
+state.settingsDraftCount = channelSettings.channelCount;
 state.currentYLimits = zeros(0, 2);
 
 fig = uifigure( ...
@@ -66,9 +73,9 @@ fig = uifigure( ...
     'CloseRequestFcn', @onClose);
 
 root = uigridlayout(fig, [3 1]);
-root.RowHeight = {92, 44, '1x'};
-root.Padding = [14 14 14 14];
-root.RowSpacing = 10;
+root.RowHeight = {68, 32, '1x'};
+root.Padding = [10 6 10 6];
+root.RowSpacing = 4;
 root.BackgroundColor = windowColor;
 
 toolbar = uigridlayout(root, [1 3]);
@@ -85,7 +92,7 @@ settingsPanel = uipanel(toolbar, 'Title', '串口设置', ...
 settingsPanel.Layout.Column = 1;
 settingsGrid = uigridlayout(settingsPanel, [1 4]);
 settingsGrid.ColumnWidth = {42, '1x', 52, 92};
-settingsGrid.Padding = [10 3 10 7];
+settingsGrid.Padding = [10 2 10 4];
 settingsGrid.ColumnSpacing = 7;
 settingsGrid.BackgroundColor = cardColor;
 
@@ -106,7 +113,7 @@ actionsPanel = uipanel(toolbar, 'Title', '采集控制', ...
 actionsPanel.Layout.Column = 2;
 actionsGrid = uigridlayout(actionsPanel, [1 6]);
 actionsGrid.ColumnWidth = {'1x', '1x', '1x', '1x', '1x', '1x'};
-actionsGrid.Padding = [10 3 10 7];
+actionsGrid.Padding = [10 2 10 4];
 actionsGrid.ColumnSpacing = 7;
 actionsGrid.BackgroundColor = cardColor;
 
@@ -137,9 +144,9 @@ displayPanel = uipanel(toolbar, 'Title', '显示设置', ...
     'ForegroundColor', textColor);
 displayPanel.Layout.Column = 3;
 displayGrid = uigridlayout(displayPanel, [1 5]);
-displayGrid.ColumnWidth = {72, 58, 55, 48, '1x'};
-displayGrid.Padding = [10 3 10 7];
-displayGrid.ColumnSpacing = 7;
+displayGrid.ColumnWidth = {60, 52, 48, 44, '1x'};
+displayGrid.Padding = [10 2 10 4];
+displayGrid.ColumnSpacing = 5;
 displayGrid.BackgroundColor = cardColor;
 uilabel(displayGrid, 'Text', '窗口 (s)', 'HorizontalAlignment', 'right', ...
     'FontName', uiFontName, 'FontSize', 12, 'FontColor', mutedTextColor);
@@ -162,7 +169,7 @@ statusPanel = uipanel(root, 'BackgroundColor', cardColor, ...
 statusPanel.Layout.Row = 2;
 statusGrid = uigridlayout(statusPanel, [1 5]);
 statusGrid.ColumnWidth = {28, '1x', 135, 135, 175};
-statusGrid.Padding = [10 3 10 3];
+statusGrid.Padding = [10 2 10 2];
 statusGrid.ColumnSpacing = 8;
 statusGrid.BackgroundColor = cardColor;
 statusLamp = uilamp(statusGrid, 'Color', [0.65 0.65 0.65]);
@@ -184,16 +191,17 @@ plots.Layout.Row = 3;
 plots.RowHeight = {'1x'};
 plots.ColumnWidth = {'1x'};
 plots.Padding = [0 0 0 0];
-plots.RowSpacing = 10;
+plots.RowSpacing = 4;
 plots.ColumnSpacing = 10;
 plots.BackgroundColor = windowColor;
 
 axesHandles = gobjects(0, 1);
-lineHandles = gobjects(4, 1);
-lineColors = [0.100 0.430 0.820; ...
+lineHandles = gobjects(channelSettings.channelCount, 1);
+baseLineColors = [0.100 0.430 0.820; ...
               0.920 0.430 0.160; ...
               0.180 0.620 0.400; ...
               0.540 0.330 0.760];
+lineColors = [baseLineColors; lines(maxChannelCount - size(baseLineColors, 1))];
 
 rebuildPlotLayout();
 onRefreshPorts();
@@ -240,7 +248,7 @@ onRefreshPorts();
             return;
         end
 
-        dialogSize = [930 350];
+        dialogSize = [930 500];
         mainPosition = fig.Position;
         dialogPosition = [ ...
             mainPosition(1) + (mainPosition(3) - dialogSize(1)) / 2, ...
@@ -259,17 +267,37 @@ onRefreshPorts();
         dialogRoot.RowSpacing = 10;
         dialogRoot.BackgroundColor = windowColor;
 
-        instructionLabel = uilabel(dialogRoot, ...
+        headerGrid = uigridlayout(dialogRoot, [1 3]);
+        headerGrid.Layout.Row = 1;
+        headerGrid.ColumnWidth = {'1x', 65, 70};
+        headerGrid.Padding = [0 0 0 0];
+        headerGrid.ColumnSpacing = 8;
+        headerGrid.BackgroundColor = windowColor;
+
+        instructionLabel = uilabel(headerGrid, ...
             'Text', ['图号必须在当前图表数量范围内；Y 轴范围是最小显示范围，' ...
             '勾选超限扩展后，突变只会扩大范围。'], ...
             'FontName', uiFontName, 'FontSize', 12, ...
             'FontColor', mutedTextColor);
-        instructionLabel.Layout.Row = 1;
+        instructionLabel.Layout.Column = 1;
+        channelCountLabel = uilabel(headerGrid, 'Text', '通道数', ...
+            'HorizontalAlignment', 'right', 'FontName', uiFontName, ...
+            'FontSize', 12, 'FontColor', mutedTextColor);
+        channelCountLabel.Layout.Column = 2;
+        channelCountDropDown = uidropdown(headerGrid, ...
+            'Items', cellstr(string(1:maxChannelCount)), ...
+            'Value', char(string(channelSettings.channelCount)), ...
+            'FontName', uiFontName, 'FontSize', 12);
+        channelCountDropDown.Layout.Column = 3;
+        if state.connected
+            channelCountDropDown.Enable = 'off';
+        end
 
-        rowNames = arrayfun(@(index) sprintf('Channel %d', index), ...
-            1:4, 'UniformOutput', false);
+        state.settingsDraftData = channelSettingsToTableData(channelSettings);
+        state.settingsDraftCount = channelSettings.channelCount;
+        rowNames = channelRowNames(state.settingsDraftCount);
         settingsTable = uitable(dialogRoot, ...
-            'Data', channelSettingsToTableData(channelSettings), ...
+            'Data', state.settingsDraftData(1:state.settingsDraftCount, :), ...
             'ColumnName', {'名称', '单位', '显示', '图号', '超限扩展', ...
             'Y 最小值', 'Y 最大值'}, ...
             'ColumnEditable', true(1, 7), ...
@@ -280,6 +308,9 @@ onRefreshPorts();
             'FontName', uiFontName, 'FontSize', 12, ...
             'BackgroundColor', [cardColor; 0.975 0.980 0.990]);
         settingsTable.Layout.Row = 2;
+        channelCountDropDown.ValueChangedFcn = ...
+            @(~, ~) onPendingChannelCountChanged( ...
+            settingsTable, channelCountDropDown);
 
         dialogButtons = uigridlayout(dialogRoot, [1 4]);
         dialogButtons.Layout.Row = 3;
@@ -289,13 +320,15 @@ onRefreshPorts();
         dialogButtons.BackgroundColor = windowColor;
 
         restoreButton = uibutton(dialogButtons, 'Text', '恢复默认值', ...
-            'ButtonPushedFcn', @(~, ~) restoreDefaultSettings(settingsTable));
+            'ButtonPushedFcn', @(~, ~) restoreDefaultSettings( ...
+            settingsTable, channelCountDropDown));
         restoreButton.Layout.Column = 2;
         cancelButton = uibutton(dialogButtons, 'Text', '取消', ...
             'ButtonPushedFcn', @(~, ~) closeChannelSettings());
         cancelButton.Layout.Column = 3;
         applyButton = uibutton(dialogButtons, 'Text', '应用', ...
-            'ButtonPushedFcn', @(~, ~) applySettingsFromTable(settingsTable));
+            'ButtonPushedFcn', @(~, ~) applySettingsFromTable( ...
+            settingsTable, channelCountDropDown));
         applyButton.Layout.Column = 4;
 
         set([restoreButton, cancelButton], ...
@@ -306,15 +339,46 @@ onRefreshPorts();
             'FontSize', 12, 'FontWeight', 'bold');
     end
 
-    function restoreDefaultSettings(settingsTable)
+    function onPendingChannelCountChanged(settingsTable, channelCountDropDown)
+        state.settingsDraftData(1:state.settingsDraftCount, :) = ...
+            settingsTable.Data;
+        pendingCount = str2double(channelCountDropDown.Value);
+        state.settingsDraftCount = pendingCount;
+        settingsTable.Data = state.settingsDraftData(1:pendingCount, :);
+        settingsTable.RowName = channelRowNames(pendingCount);
+    end
+
+    function restoreDefaultSettings(settingsTable, channelCountDropDown)
         settings = defaultChannelSettings();
         settings.plotCount = channelSettings.plotCount;
         settings.plotIndex = min(settings.plotIndex, settings.plotCount);
-        settingsTable.Data = channelSettingsToTableData(settings);
+        pendingCount = str2double(channelCountDropDown.Value);
+        settings.channelCount = pendingCount;
+        state.settingsDraftData = channelSettingsToTableData(settings);
+        state.settingsDraftCount = pendingCount;
+        settingsTable.Data = state.settingsDraftData(1:pendingCount, :);
+        settingsTable.RowName = channelRowNames(pendingCount);
     end
 
-    function applySettingsFromTable(settingsTable)
-        data = settingsTable.Data;
+    function applySettingsFromTable(settingsTable, channelCountDropDown)
+        state.settingsDraftData(1:state.settingsDraftCount, :) = ...
+            settingsTable.Data;
+        pendingCount = str2double(channelCountDropDown.Value);
+        if pendingCount ~= channelSettings.channelCount
+            if state.connected
+                uialert(state.settingsFigure, ...
+                    '请先断开串口连接，再修改通道数量。', '无法修改通道数');
+                return;
+            end
+            if state.sampleCount > 0
+                uialert(state.settingsFigure, ...
+                    ['修改通道数前，请先保存需要的数据，然后使用“清屏”' ...
+                    '清空当前缓存。'], '缓存非空');
+                return;
+            end
+        end
+
+        data = state.settingsDraftData;
         try
             names = strtrim(string(data(:, 1))).';
             units = strtrim(string(data(:, 2))).';
@@ -331,7 +395,7 @@ onRefreshPorts();
 
         if any(strlength(names) == 0)
             uialert(state.settingsFigure, ...
-                '四个通道的名称均不能为空。', '设置无效');
+                '所有通道的名称均不能为空。', '设置无效');
             return;
         end
 
@@ -357,9 +421,17 @@ onRefreshPorts();
         channelSettings.plotIndex = plotIndex;
         channelSettings.expandY = expandY;
         channelSettings.yLimits = yLimits;
+        channelCountChanged = pendingCount ~= channelSettings.channelCount;
+        channelSettings.channelCount = pendingCount;
         channelNames = names;
         channelUnits = units;
+        if channelCountChanged
+            resetAcquisitionData(pendingCount);
+        end
         rebuildPlotLayout();
+        if channelCountChanged
+            updateCounters(true);
+        end
 
         [saved, errorMessage] = saveChannelSettings();
         if ~saved
@@ -378,6 +450,8 @@ onRefreshPorts();
             delete(state.settingsFigure);
         end
         state.settingsFigure = [];
+        state.settingsDraftData = {};
+        state.settingsDraftCount = channelSettings.channelCount;
     end
 
     function onPlotCountChanged(~, ~)
@@ -406,33 +480,23 @@ onRefreshPorts();
         % fixed input channel and is recreated only when display mapping changes.
         delete(plots.Children);
         plotCount = channelSettings.plotCount;
-        if plotCount == 4
-            rowCount = 2;
-            columnCount = 2;
-        else
-            rowCount = plotCount;
-            columnCount = 1;
-        end
+        rowCount = plotCount;
+        columnCount = 1;
 
         plots.RowHeight = repmat({'1x'}, 1, rowCount);
         plots.ColumnWidth = repmat({'1x'}, 1, columnCount);
         axesHandles = gobjects(plotCount, 1);
-        lineHandles = gobjects(4, 1);
+        lineHandles = gobjects(channelSettings.channelCount, 1);
 
         for plotIndex = 1:plotCount
             ax = uiaxes(plots);
-            if plotCount == 4
-                ax.Layout.Row = ceil(plotIndex / 2);
-                ax.Layout.Column = mod(plotIndex - 1, 2) + 1;
-            else
-                ax.Layout.Row = plotIndex;
-                ax.Layout.Column = 1;
-            end
+            ax.Layout.Row = plotIndex;
+            ax.Layout.Column = 1;
             configurePlotAxes(ax);
             axesHandles(plotIndex) = ax;
         end
 
-        for channelIndex = 1:4
+        for channelIndex = 1:channelSettings.channelCount
             plotIndex = channelSettings.plotIndex(channelIndex);
             ax = axesHandles(plotIndex);
             lineHandles(channelIndex) = plot(ax, NaN, NaN, ...
@@ -480,9 +544,11 @@ onRefreshPorts();
     end
 
     function updatePlotLabelsAndLegends()
+        activeChannels = 1:channelSettings.channelCount;
         for plotIndex = 1:channelSettings.plotCount
-            channelIndices = find(channelSettings.visible & ...
-                channelSettings.plotIndex == plotIndex);
+            channelIndices = activeChannels( ...
+                channelSettings.visible(activeChannels) & ...
+                channelSettings.plotIndex(activeChannels) == plotIndex);
             ax = axesHandles(plotIndex);
             if isempty(channelIndices)
                 ax.Title.String = sprintf('Plot %d', plotIndex);
@@ -500,8 +566,9 @@ onRefreshPorts();
             end
 
             if numel(channelIndices) >= 2
-                legend(ax, lineHandles(channelIndices), ...
+                legendHandle = legend(ax, lineHandles(channelIndices), ...
                     cellstr(channelNames(channelIndices)), 'Location', 'best');
+                legendHandle.FontName = plotFontName;
             else
                 legend(ax, 'off');
             end
@@ -618,14 +685,15 @@ onRefreshPorts();
             fields = split(rawLine, ',');
             values = str2double(fields);
 
-            if numel(values) ~= 4 || any(~isfinite(values))
+            channelCount = channelSettings.channelCount;
+            if numel(values) ~= channelCount || any(~isfinite(values))
                 state.badFrames = state.badFrames + 1;
                 updateCounters(false);
                 return;
             end
 
             elapsed = state.timeOffset + toc(state.clock);
-            sampleValues = reshape(values, 1, 4);
+            sampleValues = reshape(values, 1, channelCount);
             state.time(state.writeIndex) = elapsed;
             state.values(state.writeIndex, :) = sampleValues;
             state.writeIndex = mod(state.writeIndex, maxStoredSamples) + 1;
@@ -667,7 +735,7 @@ onRefreshPorts();
         physicalIndices = logicalToPhysical(logicalIndices);
         shownTime = state.time(physicalIndices);
         shownValues = state.values(physicalIndices, :);
-        for channelIndex = 1:4
+        for channelIndex = 1:channelSettings.channelCount
             if channelSettings.visible(channelIndex)
                 lineHandles(channelIndex).XData = shownTime;
                 lineHandles(channelIndex).YData = shownValues(:, channelIndex);
@@ -727,16 +795,9 @@ onRefreshPorts();
     end
 
     function onClear(~, ~)
-        state.sampleCount = 0;
-        state.writeIndex = 1;
-        state.goodFrames = 0;
-        state.badFrames = 0;
-        state.clock = tic;
-        state.timeOffset = 0;
-        state.lastPlotTime = -inf;
-        state.lastCounterTime = -inf;
+        resetAcquisitionData(channelSettings.channelCount);
 
-        for channelIndex = 1:4
+        for channelIndex = 1:channelSettings.channelCount
             lineHandles(channelIndex).XData = NaN;
             lineHandles(channelIndex).YData = NaN;
         end
@@ -746,6 +807,18 @@ onRefreshPorts();
         resetYAxisRanges();
         updateCounters(true);
         statusLabel.Text = '缓存与统计已清空';
+    end
+
+    function resetAcquisitionData(channelCount)
+        state.values = zeros(maxStoredSamples, channelCount);
+        state.sampleCount = 0;
+        state.writeIndex = 1;
+        state.goodFrames = 0;
+        state.badFrames = 0;
+        state.clock = tic;
+        state.timeOffset = 0;
+        state.lastPlotTime = -inf;
+        state.lastCounterTime = -inf;
     end
 
     function onSave(~, ~)
@@ -820,6 +893,7 @@ onRefreshPorts();
         settings.expandY = defaultYAxisExpand;
         settings.yLimits = defaultYLimits;
         settings.plotCount = defaultPlotCount;
+        settings.channelCount = defaultChannelCount;
     end
 
     function settings = loadChannelSettings()
@@ -842,13 +916,19 @@ onRefreshPorts();
                 return;
             end
 
-            settings.names = reshape(strtrim(string(storedSettings.names)), 1, 4);
-            settings.units = reshape(strtrim(string(storedSettings.units)), 1, 4);
-            settings.visible = reshape(logical(storedSettings.visible), 1, 4);
-            settings.plotIndex = reshape(double(storedSettings.plotIndex), 1, 4);
-            settings.expandY = reshape(logical(storedSettings.expandY), 1, 4);
+            settings.names = reshape(strtrim(string(storedSettings.names)), ...
+                1, maxChannelCount);
+            settings.units = reshape(strtrim(string(storedSettings.units)), ...
+                1, maxChannelCount);
+            settings.visible = reshape(logical(storedSettings.visible), ...
+                1, maxChannelCount);
+            settings.plotIndex = reshape(double(storedSettings.plotIndex), ...
+                1, maxChannelCount);
+            settings.expandY = reshape(logical(storedSettings.expandY), ...
+                1, maxChannelCount);
             settings.yLimits = double(storedSettings.yLimits);
             settings.plotCount = double(storedSettings.plotCount);
+            settings.channelCount = double(storedSettings.channelCount);
         catch
             settings = defaultChannelSettings();
         end
@@ -860,12 +940,39 @@ onRefreshPorts();
             return;
         end
 
-        fieldNames = {'names', 'units', 'visible', 'plotIndex', ...
-            'expandY', 'yLimits', 'plotCount'};
-        for fieldIndex = 1:numel(fieldNames)
-            fieldName = fieldNames{fieldIndex};
-            if isfield(storedSettings, fieldName)
-                settings.(fieldName) = storedSettings.(fieldName);
+        if isfield(storedSettings, 'plotCount')
+            settings.plotCount = storedSettings.plotCount;
+        end
+        if isfield(storedSettings, 'channelCount')
+            settings.channelCount = storedSettings.channelCount;
+        end
+
+        vectorFields = {'names', 'units', 'visible', 'plotIndex', 'expandY'};
+        for fieldIndex = 1:numel(vectorFields)
+            fieldName = vectorFields{fieldIndex};
+            if ~isfield(storedSettings, fieldName)
+                continue;
+            end
+            switch fieldName
+                case {'names', 'units'}
+                    storedValues = reshape( ...
+                        string(storedSettings.(fieldName)), 1, []);
+                case {'visible', 'expandY'}
+                    storedValues = reshape( ...
+                        logical(storedSettings.(fieldName)), 1, []);
+                otherwise
+                    storedValues = reshape( ...
+                        double(storedSettings.(fieldName)), 1, []);
+            end
+            copyCount = min(numel(storedValues), maxChannelCount);
+            settings.(fieldName)(1:copyCount) = storedValues(1:copyCount);
+        end
+        if isfield(storedSettings, 'yLimits')
+            storedYLimits = double(storedSettings.yLimits);
+            if size(storedYLimits, 2) == 2
+                copyCount = min(size(storedYLimits, 1), maxChannelCount);
+                settings.yLimits(1:copyCount, :) = ...
+                    storedYLimits(1:copyCount, :);
             end
         end
 
@@ -878,7 +985,7 @@ onRefreshPorts();
 
     function valid = isValidChannelSettings(settings)
         requiredFields = {'names', 'units', 'visible', 'plotIndex', ...
-            'expandY', 'yLimits', 'plotCount'};
+            'expandY', 'yLimits', 'plotCount', 'channelCount'};
         valid = isstruct(settings) && all(isfield(settings, requiredFields));
         if ~valid
             return;
@@ -892,17 +999,24 @@ onRefreshPorts();
             expandY = double(settings.expandY);
             yLimits = double(settings.yLimits);
             plotCount = double(settings.plotCount);
-            valid = numel(names) == 4 && numel(units) == 4 && ...
-                numel(visible) == 4 && all(isfinite(visible)) && ...
+            channelCount = double(settings.channelCount);
+            valid = numel(names) == maxChannelCount && ...
+                numel(units) == maxChannelCount && ...
+                numel(visible) == maxChannelCount && all(isfinite(visible)) && ...
                 all(visible == 0 | visible == 1) && ...
-                numel(plotIndex) == 4 && all(isfinite(plotIndex)) && ...
+                numel(plotIndex) == maxChannelCount && ...
+                all(isfinite(plotIndex)) && ...
                 all(plotIndex == round(plotIndex)) && all(plotIndex >= 1) && ...
                 isscalar(plotCount) && isfinite(plotCount) && ...
                 plotCount == round(plotCount) && plotCount >= 1 && ...
                 plotCount <= 4 && all(plotIndex <= plotCount) && ...
-                numel(expandY) == 4 && all(isfinite(expandY)) && ...
+                isscalar(channelCount) && isfinite(channelCount) && ...
+                channelCount == round(channelCount) && channelCount >= 1 && ...
+                channelCount <= maxChannelCount && ...
+                numel(expandY) == maxChannelCount && ...
+                all(isfinite(expandY)) && ...
                 all(expandY == 0 | expandY == 1) && ...
-                isequal(size(yLimits), [4 2]) && ...
+                isequal(size(yLimits), [maxChannelCount 2]) && ...
                 all(isfinite(yLimits), 'all') && ...
                 all(yLimits(:, 1) < yLimits(:, 2)) && ...
                 all(strlength(names) > 0);
@@ -912,8 +1026,8 @@ onRefreshPorts();
     end
 
     function data = channelSettingsToTableData(settings)
-        data = cell(4, 7);
-        for index = 1:4
+        data = cell(maxChannelCount, 7);
+        for index = 1:maxChannelCount
             data{index, 1} = char(settings.names(index));
             data{index, 2} = char(settings.units(index));
             data{index, 3} = logical(settings.visible(index));
@@ -922,6 +1036,11 @@ onRefreshPorts();
             data{index, 6} = settings.yLimits(index, 1);
             data{index, 7} = settings.yLimits(index, 2);
         end
+    end
+
+    function rowNames = channelRowNames(channelCount)
+        rowNames = arrayfun(@(index) sprintf('Channel %d', index), ...
+            1:channelCount, 'UniformOutput', false);
     end
 
     function [saved, errorMessage] = saveChannelSettings()
@@ -958,10 +1077,12 @@ onRefreshPorts();
     function expandYAxisForExtrema(minimums, maximums)
         limitsChanged = false;
         baseLimits = plotBaseYLimits();
+        activeChannels = 1:channelSettings.channelCount;
         for plotIndex = 1:channelSettings.plotCount
-            channelIndices = find(channelSettings.visible & ...
-                channelSettings.plotIndex == plotIndex & ...
-                channelSettings.expandY);
+            channelIndices = activeChannels( ...
+                channelSettings.visible(activeChannels) & ...
+                channelSettings.plotIndex(activeChannels) == plotIndex & ...
+                channelSettings.expandY(activeChannels));
             margin = yExpansionMargin * diff(baseLimits(plotIndex, :));
             for channelIndex = channelIndices
                 if minimums(channelIndex) < state.currentYLimits(plotIndex, 1)
@@ -984,9 +1105,11 @@ onRefreshPorts();
 
     function limits = plotBaseYLimits()
         limits = repmat([0 1], channelSettings.plotCount, 1);
+        activeChannels = 1:channelSettings.channelCount;
         for plotIndex = 1:channelSettings.plotCount
-            channelIndices = find(channelSettings.visible & ...
-                channelSettings.plotIndex == plotIndex);
+            channelIndices = activeChannels( ...
+                channelSettings.visible(activeChannels) & ...
+                channelSettings.plotIndex(activeChannels) == plotIndex);
             if isempty(channelIndices)
                 continue;
             end
@@ -1002,8 +1125,9 @@ onRefreshPorts();
     end
 
     function variableNames = buildCsvVariableNames()
-        channelVariableNames = channelNames;
-        for index = 1:4
+        channelCount = channelSettings.channelCount;
+        channelVariableNames = channelNames(1:channelCount);
+        for index = 1:channelCount
             if strlength(channelUnits(index)) > 0
                 channelVariableNames(index) = channelNames(index) + ...
                     "_" + channelUnits(index);
@@ -1015,6 +1139,26 @@ onRefreshPorts();
         channelVariableNames = matlab.lang.makeUniqueStrings( ...
             channelVariableNames, {'Time_s'});
         variableNames = [{'Time_s'}, channelVariableNames];
+    end
+
+    function fontName = selectAvailableFont(preferredFont, fallbackFonts)
+        candidates = [string(preferredFont), string(fallbackFonts)];
+        fontName = char(candidates(1));
+        try
+            installedFonts = string(listfonts);
+            for fontIndex = 1:numel(candidates)
+                if any(strcmpi(installedFonts, candidates(fontIndex)))
+                    fontName = char(candidates(fontIndex));
+                    return;
+                end
+            end
+            if ~isempty(installedFonts)
+                fontName = char(installedFonts(1));
+            end
+        catch
+            % Let MATLAB perform its normal font substitution if font
+            % enumeration is unavailable on the current platform.
+        end
     end
 
     function disconnectSerial(message)
