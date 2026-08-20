@@ -18,6 +18,10 @@ defaultYAxisExpand = true(1, maxChannelCount);
 defaultYLimits = repmat([0 1], maxChannelCount, 1);
 defaultChannelVisible = true(1, maxChannelCount);
 defaultPlotIndex = mod(0:(maxChannelCount - 1), defaultPlotCount) + 1;
+defaultColorPalette = [31 119 180; 255 127 14; 44 160 44; 214 39 40; ...
+    148 103 189; 140 86 75; 227 119 194; 127 127 127; ...
+    188 189 34; 23 190 207; 174 199 232; 255 187 120; ...
+    152 223 138; 255 152 150; 197 176 213; 196 156 148] / 255;
 yExpansionMargin = 0.05;
 preferencesGroup = 'DSPSerialMonitor';
 legacyPreferencesGroup = 'BoostSerialMonitor';
@@ -64,6 +68,10 @@ state.closing = false;
 state.settingsFigure = [];
 state.settingsDraftData = {};
 state.settingsDraftCount = channelSettings.channelCount;
+state.settingsDraftColors = channelSettings.colors;
+state.settingsDraftColorIsCustom = channelSettings.colorIsCustom;
+state.settingsSelectedChannel = 1;
+state.settingsColorButton = [];
 state.currentYLimits = zeros(0, 2);
 
 fig = uifigure( ...
@@ -197,11 +205,6 @@ plots.BackgroundColor = windowColor;
 
 axesHandles = gobjects(0, 1);
 lineHandles = gobjects(channelSettings.channelCount, 1);
-baseLineColors = [0.100 0.430 0.820; ...
-              0.920 0.430 0.160; ...
-              0.180 0.620 0.400; ...
-              0.540 0.330 0.760];
-lineColors = [baseLineColors; lines(maxChannelCount - size(baseLineColors, 1))];
 
 rebuildPlotLayout();
 onRefreshPorts();
@@ -248,7 +251,7 @@ onRefreshPorts();
             return;
         end
 
-        dialogSize = [930 500];
+        dialogSize = [980 520];
         mainPosition = fig.Position;
         dialogPosition = [ ...
             mainPosition(1) + (mainPosition(3) - dialogSize(1)) / 2, ...
@@ -276,7 +279,7 @@ onRefreshPorts();
 
         instructionLabel = uilabel(headerGrid, ...
             'Text', ['图号必须在当前图表数量范围内；Y 轴范围是最小显示范围，' ...
-            '勾选超限扩展后，突变只会扩大范围。'], ...
+            '勾选超限扩展后，突变只会扩大范围。选择表格行可设置颜色。'], ...
             'FontName', uiFontName, 'FontSize', 12, ...
             'FontColor', mutedTextColor);
         instructionLabel.Layout.Column = 1;
@@ -295,16 +298,20 @@ onRefreshPorts();
 
         state.settingsDraftData = channelSettingsToTableData(channelSettings);
         state.settingsDraftCount = channelSettings.channelCount;
+        state.settingsDraftColors = channelSettings.colors;
+        state.settingsDraftColorIsCustom = channelSettings.colorIsCustom;
+        state.settingsSelectedChannel = 1;
         rowNames = channelRowNames(state.settingsDraftCount);
         settingsTable = uitable(dialogRoot, ...
             'Data', state.settingsDraftData(1:state.settingsDraftCount, :), ...
-            'ColumnName', {'名称', '单位', '显示', '图号', '超限扩展', ...
-            'Y 最小值', 'Y 最大值'}, ...
-            'ColumnEditable', true(1, 7), ...
-            'ColumnFormat', {'char', 'char', 'logical', 'numeric', ...
+            'ColumnName', {'名称', '单位', '显示', '图号', '颜色', ...
+            '超限扩展', 'Y 最小值', 'Y 最大值'}, ...
+            'ColumnEditable', [true true true true false true true true], ...
+            'ColumnFormat', {'char', 'char', 'logical', 'numeric', 'char', ...
             'logical', 'numeric', 'numeric'}, ...
-            'ColumnWidth', {165, 90, 60, 60, 90, 105, 105}, ...
+            'ColumnWidth', {150, 80, 55, 55, 85, 85, 95, 95}, ...
             'RowName', rowNames, ...
+            'CellSelectionCallback', @onChannelTableSelection, ...
             'FontName', uiFontName, 'FontSize', 12, ...
             'BackgroundColor', [cardColor; 0.975 0.980 0.990]);
         settingsTable.Layout.Row = 2;
@@ -312,31 +319,72 @@ onRefreshPorts();
             @(~, ~) onPendingChannelCountChanged( ...
             settingsTable, channelCountDropDown);
 
-        dialogButtons = uigridlayout(dialogRoot, [1 4]);
+        dialogButtons = uigridlayout(dialogRoot, [1 5]);
         dialogButtons.Layout.Row = 3;
-        dialogButtons.ColumnWidth = {'1x', 120, 100, 100};
+        dialogButtons.ColumnWidth = {'1x', 120, 120, 100, 100};
         dialogButtons.ColumnSpacing = 8;
         dialogButtons.Padding = [0 2 0 2];
         dialogButtons.BackgroundColor = windowColor;
 
+        colorButton = uibutton(dialogButtons, 'Text', '选择颜色', ...
+            'ButtonPushedFcn', @(~, ~) chooseChannelColor(settingsTable));
+        colorButton.Layout.Column = 2;
+        state.settingsColorButton = colorButton;
         restoreButton = uibutton(dialogButtons, 'Text', '恢复默认值', ...
             'ButtonPushedFcn', @(~, ~) restoreDefaultSettings( ...
             settingsTable, channelCountDropDown));
-        restoreButton.Layout.Column = 2;
+        restoreButton.Layout.Column = 3;
         cancelButton = uibutton(dialogButtons, 'Text', '取消', ...
             'ButtonPushedFcn', @(~, ~) closeChannelSettings());
-        cancelButton.Layout.Column = 3;
+        cancelButton.Layout.Column = 4;
         applyButton = uibutton(dialogButtons, 'Text', '应用', ...
             'ButtonPushedFcn', @(~, ~) applySettingsFromTable( ...
             settingsTable, channelCountDropDown));
-        applyButton.Layout.Column = 4;
+        applyButton.Layout.Column = 5;
 
-        set([restoreButton, cancelButton], ...
+        set([colorButton, restoreButton, cancelButton], ...
             'BackgroundColor', secondaryButtonColor, ...
             'FontColor', textColor, 'FontName', uiFontName, 'FontSize', 12);
         set(applyButton, 'BackgroundColor', primaryButtonColor, ...
             'FontColor', cardColor, 'FontName', uiFontName, ...
             'FontSize', 12, 'FontWeight', 'bold');
+        updateColorButton(state.settingsDraftColors(1, :));
+    end
+
+    function onChannelTableSelection(~, event)
+        if isempty(event.Indices)
+            return;
+        end
+        selectedRow = event.Indices(1, 1);
+        if selectedRow >= 1 && selectedRow <= state.settingsDraftCount
+            state.settingsSelectedChannel = selectedRow;
+            updateColorButton(state.settingsDraftColors(selectedRow, :));
+        end
+    end
+
+    function chooseChannelColor(settingsTable)
+        channelIndex = state.settingsSelectedChannel;
+        if channelIndex < 1 || channelIndex > state.settingsDraftCount
+            return;
+        end
+
+        mainFigureForFocus = fig;
+        settingsFigureForFocus = state.settingsFigure;
+        focusCleanup = onCleanup(@() restoreMonitorWindowStack( ...
+            mainFigureForFocus, settingsFigureForFocus));
+        selectedColor = uisetcolor( ...
+            state.settingsDraftColors(channelIndex, :), ...
+            sprintf('选择 Channel %d 颜色', channelIndex));
+        if isequal(selectedColor, 0)
+            return;
+        end
+
+        state.settingsDraftColors(channelIndex, :) = selectedColor;
+        state.settingsDraftColorIsCustom(channelIndex) = true;
+        state.settingsDraftData{channelIndex, 5} = colorToHex(selectedColor);
+        settingsTable.Data = ...
+            state.settingsDraftData(1:state.settingsDraftCount, :);
+        updateColorButton(selectedColor);
     end
 
     function onPendingChannelCountChanged(settingsTable, channelCountDropDown)
@@ -346,6 +394,10 @@ onRefreshPorts();
         state.settingsDraftCount = pendingCount;
         settingsTable.Data = state.settingsDraftData(1:pendingCount, :);
         settingsTable.RowName = channelRowNames(pendingCount);
+        state.settingsSelectedChannel = min( ...
+            state.settingsSelectedChannel, pendingCount);
+        updateColorButton(state.settingsDraftColors( ...
+            state.settingsSelectedChannel, :));
     end
 
     function restoreDefaultSettings(settingsTable, channelCountDropDown)
@@ -354,10 +406,17 @@ onRefreshPorts();
         settings.plotIndex = min(settings.plotIndex, settings.plotCount);
         pendingCount = str2double(channelCountDropDown.Value);
         settings.channelCount = pendingCount;
+        settings = assignAutomaticColors(settings);
         state.settingsDraftData = channelSettingsToTableData(settings);
         state.settingsDraftCount = pendingCount;
+        state.settingsDraftColors = settings.colors;
+        state.settingsDraftColorIsCustom = settings.colorIsCustom;
+        state.settingsSelectedChannel = min( ...
+            state.settingsSelectedChannel, pendingCount);
         settingsTable.Data = state.settingsDraftData(1:pendingCount, :);
         settingsTable.RowName = channelRowNames(pendingCount);
+        updateColorButton(state.settingsDraftColors( ...
+            state.settingsSelectedChannel, :));
     end
 
     function applySettingsFromTable(settingsTable, channelCountDropDown)
@@ -384,9 +443,9 @@ onRefreshPorts();
             units = strtrim(string(data(:, 2))).';
             visible = logical(cell2mat(data(:, 3))).';
             plotIndex = double(cell2mat(data(:, 4))).';
-            expandY = logical(cell2mat(data(:, 5))).';
-            minimums = double(cell2mat(data(:, 6)));
-            maximums = double(cell2mat(data(:, 7)));
+            expandY = logical(cell2mat(data(:, 6))).';
+            minimums = double(cell2mat(data(:, 7)));
+            maximums = double(cell2mat(data(:, 8)));
         catch
             uialert(state.settingsFigure, ...
                 '请检查表格内容，上下限必须为数值。', '设置无效');
@@ -421,8 +480,19 @@ onRefreshPorts();
         channelSettings.plotIndex = plotIndex;
         channelSettings.expandY = expandY;
         channelSettings.yLimits = yLimits;
+        channelSettings.colors = state.settingsDraftColors;
+        channelSettings.colorIsCustom = ...
+            state.settingsDraftColorIsCustom;
         channelCountChanged = pendingCount ~= channelSettings.channelCount;
         channelSettings.channelCount = pendingCount;
+        channelSettings = assignAutomaticColors(channelSettings);
+        state.settingsDraftColors = channelSettings.colors;
+        state.settingsDraftColorIsCustom = channelSettings.colorIsCustom;
+        state.settingsDraftData = channelSettingsToTableData(channelSettings);
+        settingsTable.Data = ...
+            state.settingsDraftData(1:pendingCount, :);
+        updateColorButton(state.settingsDraftColors( ...
+            state.settingsSelectedChannel, :));
         channelNames = names;
         channelUnits = units;
         if channelCountChanged
@@ -452,6 +522,10 @@ onRefreshPorts();
         state.settingsFigure = [];
         state.settingsDraftData = {};
         state.settingsDraftCount = channelSettings.channelCount;
+        state.settingsDraftColors = channelSettings.colors;
+        state.settingsDraftColorIsCustom = channelSettings.colorIsCustom;
+        state.settingsSelectedChannel = 1;
+        state.settingsColorButton = [];
     end
 
     function onPlotCountChanged(~, ~)
@@ -465,6 +539,7 @@ onRefreshPorts();
 
         channelSettings.plotCount = plotCount;
         channelSettings.plotIndex = min(channelSettings.plotIndex, plotCount);
+        channelSettings = assignAutomaticColors(channelSettings);
         rebuildPlotLayout();
         [saved, errorMessage] = saveChannelSettings();
         if saved
@@ -500,7 +575,8 @@ onRefreshPorts();
             plotIndex = channelSettings.plotIndex(channelIndex);
             ax = axesHandles(plotIndex);
             lineHandles(channelIndex) = plot(ax, NaN, NaN, ...
-                'LineWidth', 1.5, 'Color', lineColors(channelIndex, :), ...
+                'LineWidth', 1.5, ...
+                'Color', channelSettings.colors(channelIndex, :), ...
                 'DisplayName', char(channelNames(channelIndex)));
             if channelSettings.visible(channelIndex)
                 lineHandles(channelIndex).Visible = 'on';
@@ -894,6 +970,9 @@ onRefreshPorts();
         settings.yLimits = defaultYLimits;
         settings.plotCount = defaultPlotCount;
         settings.channelCount = defaultChannelCount;
+        settings.colors = zeros(maxChannelCount, 3);
+        settings.colorIsCustom = false(1, maxChannelCount);
+        settings = assignAutomaticColors(settings);
     end
 
     function settings = loadChannelSettings()
@@ -929,6 +1008,10 @@ onRefreshPorts();
             settings.yLimits = double(storedSettings.yLimits);
             settings.plotCount = double(storedSettings.plotCount);
             settings.channelCount = double(storedSettings.channelCount);
+            settings.colors = double(storedSettings.colors);
+            settings.colorIsCustom = reshape( ...
+                logical(storedSettings.colorIsCustom), 1, maxChannelCount);
+            settings = assignAutomaticColors(settings);
         catch
             settings = defaultChannelSettings();
         end
@@ -975,17 +1058,39 @@ onRefreshPorts();
                     storedYLimits(1:copyCount, :);
             end
         end
+        if isfield(storedSettings, 'colors') && ...
+                isfield(storedSettings, 'colorIsCustom')
+            storedColors = double(storedSettings.colors);
+            storedCustomFlags = double(storedSettings.colorIsCustom);
+            validColors = size(storedColors, 2) == 3 && ...
+                size(storedColors, 1) <= maxChannelCount && ...
+                all(isfinite(storedColors), 'all') && ...
+                all(storedColors >= 0, 'all') && ...
+                all(storedColors <= 1, 'all');
+            validCustomFlags = numel(storedCustomFlags) <= maxChannelCount && ...
+                all(isfinite(storedCustomFlags)) && ...
+                all(storedCustomFlags == 0 | storedCustomFlags == 1);
+            if validColors && validCustomFlags
+                colorCount = size(storedColors, 1);
+                flagCount = numel(storedCustomFlags);
+                settings.colors(1:colorCount, :) = storedColors;
+                settings.colorIsCustom(1:flagCount) = ...
+                    logical(reshape(storedCustomFlags, 1, []));
+            end
+        end
 
         plotCount = double(settings.plotCount);
         if isscalar(plotCount) && isfinite(plotCount) && ...
                 plotCount == round(plotCount) && plotCount >= 1 && plotCount <= 4
             settings.plotIndex = min(double(settings.plotIndex), plotCount);
         end
+        settings = assignAutomaticColors(settings);
     end
 
     function valid = isValidChannelSettings(settings)
         requiredFields = {'names', 'units', 'visible', 'plotIndex', ...
-            'expandY', 'yLimits', 'plotCount', 'channelCount'};
+            'expandY', 'yLimits', 'plotCount', 'channelCount', ...
+            'colors', 'colorIsCustom'};
         valid = isstruct(settings) && all(isfield(settings, requiredFields));
         if ~valid
             return;
@@ -1000,6 +1105,8 @@ onRefreshPorts();
             yLimits = double(settings.yLimits);
             plotCount = double(settings.plotCount);
             channelCount = double(settings.channelCount);
+            colors = double(settings.colors);
+            colorIsCustom = double(settings.colorIsCustom);
             valid = numel(names) == maxChannelCount && ...
                 numel(units) == maxChannelCount && ...
                 numel(visible) == maxChannelCount && all(isfinite(visible)) && ...
@@ -1019,6 +1126,12 @@ onRefreshPorts();
                 isequal(size(yLimits), [maxChannelCount 2]) && ...
                 all(isfinite(yLimits), 'all') && ...
                 all(yLimits(:, 1) < yLimits(:, 2)) && ...
+                isequal(size(colors), [maxChannelCount 3]) && ...
+                all(isfinite(colors), 'all') && ...
+                all(colors >= 0, 'all') && all(colors <= 1, 'all') && ...
+                numel(colorIsCustom) == maxChannelCount && ...
+                all(isfinite(colorIsCustom)) && ...
+                all(colorIsCustom == 0 | colorIsCustom == 1) && ...
                 all(strlength(names) > 0);
         catch
             valid = false;
@@ -1026,15 +1139,69 @@ onRefreshPorts();
     end
 
     function data = channelSettingsToTableData(settings)
-        data = cell(maxChannelCount, 7);
+        data = cell(maxChannelCount, 8);
         for index = 1:maxChannelCount
             data{index, 1} = char(settings.names(index));
             data{index, 2} = char(settings.units(index));
             data{index, 3} = logical(settings.visible(index));
             data{index, 4} = settings.plotIndex(index);
-            data{index, 5} = logical(settings.expandY(index));
-            data{index, 6} = settings.yLimits(index, 1);
-            data{index, 7} = settings.yLimits(index, 2);
+            data{index, 5} = colorToHex(settings.colors(index, :));
+            data{index, 6} = logical(settings.expandY(index));
+            data{index, 7} = settings.yLimits(index, 1);
+            data{index, 8} = settings.yLimits(index, 2);
+        end
+    end
+
+    function settings = assignAutomaticColors(settings)
+        for plotIndex = 1:settings.plotCount
+            channelIndices = find(settings.plotIndex == plotIndex);
+            customIndices = channelIndices( ...
+                settings.colorIsCustom(channelIndices));
+            automaticIndices = channelIndices( ...
+                ~settings.colorIsCustom(channelIndices));
+            assignedColors = settings.colors(customIndices, :);
+            availableColors = defaultColorPalette;
+
+            for channelIndex = automaticIndices
+                if isempty(assignedColors)
+                    selectedIndex = 1;
+                else
+                    minimumDistances = inf(size(availableColors, 1), 1);
+                    for colorIndex = 1:size(availableColors, 1)
+                        differences = assignedColors - ...
+                            availableColors(colorIndex, :);
+                        minimumDistances(colorIndex) = min(sqrt( ...
+                            sum(differences .^ 2, 2)));
+                    end
+                    [~, selectedIndex] = max(minimumDistances);
+                end
+
+                selectedColor = availableColors(selectedIndex, :);
+                settings.colors(channelIndex, :) = selectedColor;
+                assignedColors(end + 1, :) = selectedColor; %#ok<AGROW>
+                availableColors(selectedIndex, :) = [];
+            end
+        end
+    end
+
+    function hexText = colorToHex(color)
+        colorBytes = round(255 * min(max(double(color), 0), 1));
+        hexText = sprintf('#%02X%02X%02X', colorBytes(1), ...
+            colorBytes(2), colorBytes(3));
+    end
+
+    function updateColorButton(color)
+        if isempty(state.settingsColorButton) || ...
+                ~isvalid(state.settingsColorButton)
+            return;
+        end
+        state.settingsColorButton.BackgroundColor = color;
+        luminance = 0.2126 * color(1) + 0.7152 * color(2) + ...
+            0.0722 * color(3);
+        if luminance < 0.5
+            state.settingsColorButton.FontColor = [1 1 1];
+        else
+            state.settingsColorButton.FontColor = textColor;
         end
     end
 
@@ -1194,4 +1361,15 @@ onRefreshPorts();
         disconnectSerial('正在关闭');
         delete(fig);
     end
+end
+
+function restoreMonitorWindowStack(mainFigure, settingsFigure)
+drawnow;
+if ~isempty(mainFigure) && isvalid(mainFigure)
+    figure(mainFigure);
+end
+if ~isempty(settingsFigure) && isvalid(settingsFigure)
+    figure(settingsFigure);
+end
+drawnow;
 end
