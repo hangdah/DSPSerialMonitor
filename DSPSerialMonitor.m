@@ -35,6 +35,12 @@ maxStoredSamples = 360000; % About one hour at 100 samples/s.
 plotPeriod = 0.05;         % Refresh plots at no more than 20 frames/s.
 counterPeriod = 0.2;       % Refresh counters at no more than 5 frames/s.
 maxPlotSamples = 2000;     % Limit graphics load for long time windows.
+maxDspParameterCount = 32;
+dspParameterPreferencesKey = 'DspParameterSettings';
+
+% Only parameters in this whitelist can be written from MATLAB. The DSP
+% firmware must apply the same whitelist and range checks independently.
+dspParameters = loadDspParameters();
 
 uiFontName = selectAvailableFont('Microsoft YaHei', ...
     {'Microsoft YaHei UI', 'SimHei', 'Noto Sans CJK SC', ...
@@ -73,6 +79,23 @@ state.settingsDraftColorIsCustom = channelSettings.colorIsCustom;
 state.settingsSelectedChannel = 1;
 state.settingsColorButton = [];
 state.currentYLimits = zeros(0, 2);
+state.dspParameterFigure = [];
+state.dspParameterTable = [];
+state.dspParameterSendButton = [];
+state.dspParameterConnectionLabel = [];
+state.dspParameterCountLabel = [];
+state.dspParameterAddButton = [];
+state.dspParameterDeleteButton = [];
+state.dspParameterRestoreButton = [];
+state.dspParameterSelectedRow = 0;
+state.txCount = 0;
+state.txErrorCount = 0;
+state.commandAckCount = 0;
+state.commandErrorCount = 0;
+state.lastCommand = '';
+state.pendingCommand = '';
+state.pendingVariable = '';
+state.pendingValue = NaN;
 
 fig = uifigure( ...
     'Name', 'DSP Serial Monitor', ...
@@ -119,8 +142,8 @@ actionsPanel = uipanel(toolbar, 'Title', '采集控制', ...
     'FontName', uiFontName, 'FontSize', 12, 'FontWeight', 'bold', ...
     'ForegroundColor', textColor);
 actionsPanel.Layout.Column = 2;
-actionsGrid = uigridlayout(actionsPanel, [1 6]);
-actionsGrid.ColumnWidth = {'1x', '1x', '1x', '1x', '1x', '1x'};
+actionsGrid = uigridlayout(actionsPanel, [1 7]);
+actionsGrid.ColumnWidth = repmat({'1x'}, 1, 7);
 actionsGrid.Padding = [10 2 10 4];
 actionsGrid.ColumnSpacing = 7;
 actionsGrid.BackgroundColor = cardColor;
@@ -131,6 +154,9 @@ connectButton = uibutton(actionsGrid, 'Text', '连接', ...
     'ButtonPushedFcn', @onConnectToggle);
 pauseButton = uibutton(actionsGrid, 'Text', '暂停显示', ...
     'Enable', 'off', 'ButtonPushedFcn', @onPauseToggle);
+dspParameterButton = uibutton(actionsGrid, 'Text', 'DSP 参数', ...
+    'Tag', 'DspParameterButton', ...
+    'ButtonPushedFcn', @onOpenDspParameterSettings);
 resetYAxisButton = uibutton(actionsGrid, 'Text', '重置Y轴', ...
     'ButtonPushedFcn', @onResetYAxis);
 clearButton = uibutton(actionsGrid, 'Text', '清屏', ...
@@ -138,8 +164,8 @@ clearButton = uibutton(actionsGrid, 'Text', '清屏', ...
 saveButton = uibutton(actionsGrid, 'Text', '保存 CSV', ...
     'ButtonPushedFcn', @onSave);
 
-secondaryButtons = [refreshButton, pauseButton, resetYAxisButton, ...
-    clearButton, saveButton];
+secondaryButtons = [refreshButton, pauseButton, dspParameterButton, ...
+    resetYAxisButton, clearButton, saveButton];
 set(secondaryButtons, 'BackgroundColor', secondaryButtonColor, ...
     'FontColor', textColor, 'FontName', uiFontName, 'FontSize', 12);
 set(connectButton, 'BackgroundColor', primaryButtonColor, ...
@@ -528,6 +554,442 @@ onRefreshPorts();
         state.settingsColorButton = [];
     end
 
+    function onOpenDspParameterSettings(~, ~)
+        if ~isempty(state.dspParameterFigure) && ...
+                isvalid(state.dspParameterFigure)
+            figure(state.dspParameterFigure);
+            return;
+        end
+
+        state.dspParameterSelectedRow = 0;
+        dialogSize = [900 440];
+        mainPosition = fig.Position;
+        dialogPosition = [ ...
+            mainPosition(1) + (mainPosition(3) - dialogSize(1)) / 2, ...
+            mainPosition(2) + (mainPosition(4) - dialogSize(2)) / 2, ...
+            dialogSize];
+        state.dspParameterFigure = uifigure( ...
+            'Name', 'DSP 参数控制', ...
+            'Tag', 'DspParameterFigure', ...
+            'Position', dialogPosition, ...
+            'Color', windowColor, ...
+            'CloseRequestFcn', @(~, ~) closeDspParameterSettings());
+
+        dialogRoot = uigridlayout(state.dspParameterFigure, [3 1]);
+        dialogRoot.RowHeight = {50, '1x', 48};
+        dialogRoot.Padding = [16 14 16 14];
+        dialogRoot.RowSpacing = 10;
+        dialogRoot.BackgroundColor = windowColor;
+
+        headerGrid = uigridlayout(dialogRoot, [2 2]);
+        headerGrid.Layout.Row = 1;
+        headerGrid.RowHeight = {24, 20};
+        headerGrid.ColumnWidth = {'1x', 90};
+        headerGrid.Padding = [0 0 0 0];
+        headerGrid.RowSpacing = 2;
+        headerGrid.ColumnSpacing = 8;
+        headerGrid.BackgroundColor = windowColor;
+        instructionLabel = uilabel(headerGrid, ...
+            'Text', ['可编辑参数名称、值、单位和范围；只有收到 DSP 的 ' ...
+            'ACK 才表示写入成功。'], ...
+            'FontName', uiFontName, 'FontSize', 12, ...
+            'FontWeight', 'bold', 'FontColor', textColor);
+        instructionLabel.Layout.Row = 1;
+        instructionLabel.Layout.Column = [1 2];
+        state.dspParameterConnectionLabel = uilabel(headerGrid, ...
+            'Text', '', 'FontName', uiFontName, 'FontSize', 11, ...
+            'FontColor', mutedTextColor);
+        state.dspParameterConnectionLabel.Layout.Row = 2;
+        state.dspParameterConnectionLabel.Layout.Column = 1;
+        state.dspParameterCountLabel = uilabel(headerGrid, ...
+            'Text', '', 'HorizontalAlignment', 'right', ...
+            'FontName', uiFontName, 'FontSize', 11, ...
+            'FontColor', mutedTextColor);
+        state.dspParameterCountLabel.Layout.Row = 2;
+        state.dspParameterCountLabel.Layout.Column = 2;
+
+        state.dspParameterTable = uitable(dialogRoot, ...
+            'Tag', 'DspParameterTable', ...
+            'Data', dspParameterTableData(), ...
+            'ColumnName', {'参数名称', '当前设定值', '单位', ...
+            '最小值', '最大值', '状态'}, ...
+            'ColumnEditable', [true true true true true false], ...
+            'ColumnFormat', {'char', 'numeric', 'char', 'numeric', ...
+            'numeric', 'char'}, ...
+            'ColumnWidth', {175, 115, 80, 95, 95, 125}, ...
+            'RowName', [], ...
+            'CellSelectionCallback', @onDspParameterSelection, ...
+            'CellEditCallback', @onDspParameterEdit, ...
+            'FontName', uiFontName, 'FontSize', 12, ...
+            'BackgroundColor', [cardColor; 0.975 0.980 0.990]);
+        state.dspParameterTable.Layout.Row = 2;
+
+        dialogButtons = uigridlayout(dialogRoot, [1 6]);
+        dialogButtons.Layout.Row = 3;
+        dialogButtons.ColumnWidth = {'1x', 105, 115, 105, 150, 90};
+        dialogButtons.ColumnSpacing = 8;
+        dialogButtons.Padding = [0 2 0 2];
+        dialogButtons.BackgroundColor = windowColor;
+        state.dspParameterAddButton = uibutton(dialogButtons, ...
+            'Text', '新增参数', 'Tag', 'DspParameterAddButton', ...
+            'ButtonPushedFcn', @onAddDspParameter, ...
+            'BackgroundColor', secondaryButtonColor, ...
+            'FontColor', textColor, 'FontName', uiFontName, 'FontSize', 12);
+        state.dspParameterAddButton.Layout.Column = 2;
+        state.dspParameterDeleteButton = uibutton(dialogButtons, ...
+            'Text', '删除选中', 'Tag', 'DspParameterDeleteButton', ...
+            'ButtonPushedFcn', @onDeleteDspParameter, ...
+            'BackgroundColor', secondaryButtonColor, ...
+            'FontColor', textColor, 'FontName', uiFontName, 'FontSize', 12);
+        state.dspParameterDeleteButton.Layout.Column = 3;
+        state.dspParameterRestoreButton = uibutton(dialogButtons, ...
+            'Text', '恢复默认', 'Tag', 'DspParameterRestoreButton', ...
+            'ButtonPushedFcn', @onRestoreDefaultDspParameters, ...
+            'BackgroundColor', secondaryButtonColor, ...
+            'FontColor', textColor, 'FontName', uiFontName, 'FontSize', 12);
+        state.dspParameterRestoreButton.Layout.Column = 4;
+        state.dspParameterSendButton = uibutton(dialogButtons, ...
+            'Text', '发送选中参数', ...
+            'Tag', 'DspParameterSendButton', ...
+            'ButtonPushedFcn', @onSendSelectedDspParameter, ...
+            'BackgroundColor', primaryButtonColor, ...
+            'FontColor', cardColor, 'FontName', uiFontName, ...
+            'FontSize', 12, 'FontWeight', 'bold');
+        state.dspParameterSendButton.Layout.Column = 5;
+        closeButton = uibutton(dialogButtons, 'Text', '关闭', ...
+            'ButtonPushedFcn', @(~, ~) closeDspParameterSettings(), ...
+            'BackgroundColor', secondaryButtonColor, ...
+            'FontColor', textColor, 'FontName', uiFontName, 'FontSize', 12);
+        closeButton.Layout.Column = 6;
+        updateDspParameterControls();
+    end
+
+    function onDspParameterSelection(~, event)
+        if isempty(event.Indices)
+            return;
+        end
+        selectedRow = event.Indices(1, 1);
+        if selectedRow >= 1 && selectedRow <= numel(dspParameters.names)
+            state.dspParameterSelectedRow = selectedRow;
+            updateDspParameterButtonStates();
+        end
+    end
+
+    function onDspParameterEdit(~, event)
+        if isempty(event.Indices) || event.Indices(1, 2) > 5
+            return;
+        end
+
+        parameterIndex = event.Indices(1, 1);
+        columnIndex = event.Indices(1, 2);
+        state.dspParameterSelectedRow = parameterIndex;
+        variableName = dspParameters.names(parameterIndex);
+        if strcmp(state.pendingVariable, char(variableName))
+            updateDspParameterControls();
+            uialert(state.dspParameterFigure, ...
+                '该参数正在等待 DSP 确认，暂时不能修改。', '参数等待确认');
+            return;
+        end
+
+        pendingParameters = dspParameters;
+        switch columnIndex
+            case 1
+                pendingParameters.names(parameterIndex) = ...
+                    strtrim(string(event.NewData));
+            case 2
+                pendingParameters.values(parameterIndex) = ...
+                    numericDspParameterValue(event.NewData);
+            case 3
+                pendingParameters.units(parameterIndex) = ...
+                    strtrim(string(event.NewData));
+            case 4
+                pendingParameters.minimums(parameterIndex) = ...
+                    numericDspParameterValue(event.NewData);
+            case 5
+                pendingParameters.maximums(parameterIndex) = ...
+                    numericDspParameterValue(event.NewData);
+        end
+
+        [validSettings, errorMessage] = ...
+            isValidDspParameterSettings(pendingParameters);
+        if ~validSettings
+            updateDspParameterControls();
+            uialert(state.dspParameterFigure, errorMessage, '参数无效');
+            return;
+        end
+
+        dspParameters = pendingParameters;
+        dspParameters.confirmedValues(parameterIndex) = NaN;
+        dspParameters.statuses(parameterIndex) = "未发送";
+        updateDspParameterControls();
+        saveDspParameterSettingsWithAlert();
+    end
+
+    function onAddDspParameter(~, ~)
+        if ~isempty(state.pendingCommand) || ...
+                numel(dspParameters.names) >= maxDspParameterCount
+            return;
+        end
+
+        parameterNumber = 1;
+        while any(strcmpi(dspParameters.names, ...
+                "PARAM_" + string(parameterNumber)))
+            parameterNumber = parameterNumber + 1;
+        end
+        dspParameters.names(end + 1) = "PARAM_" + string(parameterNumber);
+        dspParameters.units(end + 1) = "";
+        dspParameters.minimums(end + 1) = 0;
+        dspParameters.maximums(end + 1) = 1;
+        dspParameters.values(end + 1) = 0;
+        dspParameters.confirmedValues(end + 1) = NaN;
+        dspParameters.statuses(end + 1) = "未发送";
+        state.dspParameterSelectedRow = numel(dspParameters.names);
+        updateDspParameterControls();
+        saveDspParameterSettingsWithAlert();
+        statusLabel.Text = sprintf('已新增参数 %s', ...
+            char(dspParameters.names(end)));
+    end
+
+    function onDeleteDspParameter(~, ~)
+        parameterCount = numel(dspParameters.names);
+        parameterIndex = state.dspParameterSelectedRow;
+        if ~isempty(state.pendingCommand) || parameterCount <= 1 || ...
+                parameterIndex < 1 || parameterIndex > parameterCount
+            return;
+        end
+
+        variableName = dspParameters.names(parameterIndex);
+        choice = uiconfirm(state.dspParameterFigure, sprintf( ...
+            '确定删除参数 %s 吗？', char(variableName)), ...
+            '删除 DSP 参数', 'Options', {'删除', '取消'}, ...
+            'DefaultOption', 2, 'CancelOption', 2);
+        if ~strcmp(choice, '删除')
+            return;
+        end
+
+        keepIndices = true(1, parameterCount);
+        keepIndices(parameterIndex) = false;
+        dspParameters.names = dspParameters.names(keepIndices);
+        dspParameters.units = dspParameters.units(keepIndices);
+        dspParameters.minimums = dspParameters.minimums(keepIndices);
+        dspParameters.maximums = dspParameters.maximums(keepIndices);
+        dspParameters.values = dspParameters.values(keepIndices);
+        dspParameters.confirmedValues = ...
+            dspParameters.confirmedValues(keepIndices);
+        dspParameters.statuses = dspParameters.statuses(keepIndices);
+        state.dspParameterSelectedRow = 0;
+        updateDspParameterControls();
+        saveDspParameterSettingsWithAlert();
+        statusLabel.Text = sprintf('已删除参数 %s', char(variableName));
+    end
+
+    function onRestoreDefaultDspParameters(~, ~)
+        if ~isempty(state.pendingCommand)
+            return;
+        end
+        choice = uiconfirm(state.dspParameterFigure, ...
+            '确定恢复默认的四个 DSP 参数吗？当前自定义清单将被替换。', ...
+            '恢复默认参数', 'Options', {'恢复默认', '取消'}, ...
+            'DefaultOption', 2, 'CancelOption', 2);
+        if ~strcmp(choice, '恢复默认')
+            return;
+        end
+
+        dspParameters = defaultDspParameters();
+        state.dspParameterSelectedRow = 0;
+        updateDspParameterControls();
+        saveDspParameterSettingsWithAlert();
+        statusLabel.Text = 'DSP 参数清单已恢复默认值';
+    end
+
+    function onSendSelectedDspParameter(~, ~)
+        parameterIndex = state.dspParameterSelectedRow;
+        if parameterIndex < 1 || ...
+                parameterIndex > numel(dspParameters.names)
+            return;
+        end
+        sendDspParameter(dspParameters.names(parameterIndex), ...
+            dspParameters.values(parameterIndex));
+    end
+
+    function sendDspParameter(variableName, value)
+        if ~state.connected || isempty(state.serial)
+            updateDspParameterControls();
+            uialert(state.dspParameterFigure, ...
+                '请先连接串口，再发送 DSP 参数。', '串口未连接');
+            return;
+        end
+        if ~isempty(state.pendingCommand)
+            statusLabel.Text = sprintf('正在等待 %s 的 DSP 确认', ...
+                state.pendingVariable);
+            return;
+        end
+
+        parameterIndex = findDspParameter(variableName);
+        if isempty(parameterIndex) || ~isscalar(value) || ...
+                ~isfinite(value) || ...
+                value < dspParameters.minimums(parameterIndex) || ...
+                value > dspParameters.maximums(parameterIndex)
+            state.txErrorCount = state.txErrorCount + 1;
+            statusLabel.Text = 'DSP 参数未通过本地白名单或范围检查';
+            return;
+        end
+
+        command = sprintf('SET,%s,%.15g', char(variableName), value);
+        state.lastCommand = command;
+        state.pendingCommand = command;
+        state.pendingVariable = char(variableName);
+        state.pendingValue = value;
+        dspParameters.statuses(parameterIndex) = "等待确认";
+        updateDspParameterControls();
+        statusLabel.Text = sprintf('已发送 %s，等待 DSP 确认', command);
+
+        try
+            writeline(state.serial, command);
+            state.txCount = state.txCount + 1;
+        catch exception
+            state.txErrorCount = state.txErrorCount + 1;
+            dspParameters.statuses(parameterIndex) = "写入失败";
+            clearPendingCommand();
+            updateDspParameterControls();
+            statusLabel.Text = ['参数发送失败: ' exception.message];
+            uialert(state.dspParameterFigure, exception.message, ...
+                '参数发送失败');
+        end
+    end
+
+    function parameterIndex = findDspParameter(variableName)
+        parameterIndex = find(strcmp(dspParameters.names, ...
+            string(variableName)), 1);
+    end
+
+    function updateDspParameterControls()
+        if isempty(state.dspParameterFigure) || ...
+                ~isvalid(state.dspParameterFigure)
+            return;
+        end
+        if ~isempty(state.dspParameterTable) && ...
+                isvalid(state.dspParameterTable)
+            state.dspParameterTable.Data = dspParameterTableData();
+        end
+        updateDspParameterButtonStates();
+    end
+
+    function updateDspParameterButtonStates()
+        if isempty(state.dspParameterFigure) || ...
+                ~isvalid(state.dspParameterFigure)
+            return;
+        end
+        parameterCount = numel(dspParameters.names);
+        validSelection = state.dspParameterSelectedRow >= 1 && ...
+            state.dspParameterSelectedRow <= parameterCount;
+        noPendingCommand = isempty(state.pendingCommand);
+        if ~isempty(state.dspParameterSendButton) && ...
+                isvalid(state.dspParameterSendButton)
+            if state.connected && noPendingCommand && validSelection
+                state.dspParameterSendButton.Enable = 'on';
+            else
+                state.dspParameterSendButton.Enable = 'off';
+            end
+        end
+        if ~isempty(state.dspParameterAddButton) && ...
+                isvalid(state.dspParameterAddButton)
+            if noPendingCommand && parameterCount < maxDspParameterCount
+                state.dspParameterAddButton.Enable = 'on';
+            else
+                state.dspParameterAddButton.Enable = 'off';
+            end
+        end
+        if ~isempty(state.dspParameterDeleteButton) && ...
+                isvalid(state.dspParameterDeleteButton)
+            if noPendingCommand && parameterCount > 1 && validSelection
+                state.dspParameterDeleteButton.Enable = 'on';
+            else
+                state.dspParameterDeleteButton.Enable = 'off';
+            end
+        end
+        if ~isempty(state.dspParameterRestoreButton) && ...
+                isvalid(state.dspParameterRestoreButton)
+            if noPendingCommand
+                state.dspParameterRestoreButton.Enable = 'on';
+            else
+                state.dspParameterRestoreButton.Enable = 'off';
+            end
+        end
+        if ~isempty(state.dspParameterCountLabel) && ...
+                isvalid(state.dspParameterCountLabel)
+            state.dspParameterCountLabel.Text = sprintf('%d / %d', ...
+                parameterCount, maxDspParameterCount);
+        end
+        if ~isempty(state.dspParameterConnectionLabel) && ...
+                isvalid(state.dspParameterConnectionLabel)
+            if state.connected
+                if noPendingCommand
+                    if state.dspParameterSelectedRow == 0
+                        state.dspParameterConnectionLabel.Text = ...
+                            '串口已连接，请在表格中选择一个参数。';
+                    else
+                        state.dspParameterConnectionLabel.Text = ...
+                            '串口已连接，可以发送选中参数。';
+                    end
+                    state.dspParameterConnectionLabel.FontColor = ...
+                        [0.180 0.560 0.360];
+                else
+                    state.dspParameterConnectionLabel.Text = sprintf( ...
+                        '等待 DSP 确认：%s', state.pendingVariable);
+                    state.dspParameterConnectionLabel.FontColor = ...
+                        warningButtonColor;
+                end
+            else
+                state.dspParameterConnectionLabel.Text = ...
+                    '串口未连接：可以编辑参数，但暂时不能发送。';
+                state.dspParameterConnectionLabel.FontColor = ...
+                    mutedTextColor;
+            end
+        end
+    end
+
+    function data = dspParameterTableData()
+        parameterCount = numel(dspParameters.names);
+        data = cell(parameterCount, 6);
+        for parameterIndex = 1:parameterCount
+            data{parameterIndex, 1} = ...
+                char(dspParameters.names(parameterIndex));
+            data{parameterIndex, 2} = ...
+                dspParameters.values(parameterIndex);
+            data{parameterIndex, 3} = ...
+                char(dspParameters.units(parameterIndex));
+            data{parameterIndex, 4} = ...
+                dspParameters.minimums(parameterIndex);
+            data{parameterIndex, 5} = ...
+                dspParameters.maximums(parameterIndex);
+            data{parameterIndex, 6} = ...
+                char(dspParameters.statuses(parameterIndex));
+        end
+    end
+
+    function clearPendingCommand()
+        state.pendingCommand = '';
+        state.pendingVariable = '';
+        state.pendingValue = NaN;
+    end
+
+    function closeDspParameterSettings()
+        if ~isempty(state.dspParameterFigure) && ...
+                isvalid(state.dspParameterFigure)
+            delete(state.dspParameterFigure);
+        end
+        state.dspParameterFigure = [];
+        state.dspParameterTable = [];
+        state.dspParameterSendButton = [];
+        state.dspParameterConnectionLabel = [];
+        state.dspParameterCountLabel = [];
+        state.dspParameterAddButton = [];
+        state.dspParameterDeleteButton = [];
+        state.dspParameterRestoreButton = [];
+        state.dspParameterSelectedRow = 0;
+    end
+
     function onPlotCountChanged(~, ~)
         plotCount = str2double(plotCountDropDown.Value);
         if ~isfinite(plotCount) || plotCount ~= round(plotCount) || ...
@@ -693,6 +1155,7 @@ onRefreshPorts();
             pauseButton.Enable = 'on';
             statusLamp.Color = [0.18 0.72 0.34];
             statusLabel.Text = sprintf('已连接 %s @ %d baud', port, baud);
+            updateDspParameterControls();
         catch exception
             if ~isempty(sp)
                 try
@@ -707,6 +1170,7 @@ onRefreshPorts();
             connectButton.BackgroundColor = primaryButtonColor;
             statusLamp.Color = [0.85 0.25 0.20];
             statusLabel.Text = '连接失败';
+            updateDspParameterControls();
             diagnosis = buildSerialDiagnosis(port, baud, exception);
             uialert(fig, diagnosis, '串口连接失败');
         end
@@ -758,30 +1222,7 @@ onRefreshPorts();
 
         try
             rawLine = strtrim(readline(source));
-            fields = split(rawLine, ',');
-            values = str2double(fields);
-
-            channelCount = channelSettings.channelCount;
-            if numel(values) ~= channelCount || any(~isfinite(values))
-                state.badFrames = state.badFrames + 1;
-                updateCounters(false);
-                return;
-            end
-
-            elapsed = state.timeOffset + toc(state.clock);
-            sampleValues = reshape(values, 1, channelCount);
-            state.time(state.writeIndex) = elapsed;
-            state.values(state.writeIndex, :) = sampleValues;
-            state.writeIndex = mod(state.writeIndex, maxStoredSamples) + 1;
-            state.sampleCount = min(state.sampleCount + 1, maxStoredSamples);
-            state.goodFrames = state.goodFrames + 1;
-            expandYAxisForExtrema(sampleValues, sampleValues);
-
-            updateCounters(false);
-            if ~state.paused && elapsed - state.lastPlotTime >= plotPeriod
-                updatePlots();
-                state.lastPlotTime = elapsed;
-            end
+            processSerialMessage(rawLine);
         catch exception
             state.badFrames = state.badFrames + 1;
             updateCounters(false);
@@ -789,6 +1230,116 @@ onRefreshPorts();
                 statusLabel.Text = ['接收异常: ' exception.message];
             end
         end
+    end
+
+    function processSerialMessage(rawLine)
+        fields = strtrim(split(rawLine, ','));
+        messageType = fields(1);
+        if strcmp(messageType, "ACK")
+            try
+                processAckMessage(fields);
+            catch exception
+                registerControlProtocolError( ...
+                    ['ACK 处理失败: ' exception.message]);
+            end
+        elseif strcmp(messageType, "ERR")
+            try
+                processErrorMessage(fields);
+            catch exception
+                registerControlProtocolError( ...
+                    ['ERR 处理失败: ' exception.message]);
+            end
+        else
+            processDataFrame(fields);
+        end
+    end
+
+    function processDataFrame(fields)
+        values = str2double(fields);
+        channelCount = channelSettings.channelCount;
+        if numel(values) ~= channelCount || any(~isfinite(values))
+            state.badFrames = state.badFrames + 1;
+            updateCounters(false);
+            return;
+        end
+
+        elapsed = state.timeOffset + toc(state.clock);
+        sampleValues = reshape(values, 1, channelCount);
+        state.time(state.writeIndex) = elapsed;
+        state.values(state.writeIndex, :) = sampleValues;
+        state.writeIndex = mod(state.writeIndex, maxStoredSamples) + 1;
+        state.sampleCount = min(state.sampleCount + 1, maxStoredSamples);
+        state.goodFrames = state.goodFrames + 1;
+        expandYAxisForExtrema(sampleValues, sampleValues);
+
+        updateCounters(false);
+        if ~state.paused && elapsed - state.lastPlotTime >= plotPeriod
+            updatePlots();
+            state.lastPlotTime = elapsed;
+        end
+    end
+
+    function processAckMessage(fields)
+        if numel(fields) ~= 3
+            registerControlProtocolError('ACK 字段数量无效');
+            return;
+        end
+
+        variableName = fields(2);
+        confirmedValue = str2double(fields(3));
+        parameterIndex = findDspParameter(variableName);
+        if strlength(variableName) == 0 || isempty(parameterIndex) || ...
+                ~isscalar(confirmedValue) || ~isfinite(confirmedValue) || ...
+                confirmedValue < dspParameters.minimums(parameterIndex) || ...
+                confirmedValue > dspParameters.maximums(parameterIndex)
+            registerControlProtocolError('ACK 参数名或返回值无效');
+            return;
+        end
+
+        state.commandAckCount = state.commandAckCount + 1;
+        dspParameters.confirmedValues(parameterIndex) = confirmedValue;
+        dspParameters.values(parameterIndex) = confirmedValue;
+        dspParameters.statuses(parameterIndex) = "已确认";
+        if strcmp(state.pendingVariable, char(variableName))
+            clearPendingCommand();
+        end
+        updateDspParameterControls();
+        [saved, ~] = saveDspParameterSettings();
+        if saved
+            statusLabel.Text = sprintf('DSP 已更新 %s = %.15g', ...
+                char(variableName), confirmedValue);
+        else
+            statusLabel.Text = sprintf( ...
+                'DSP 已更新 %s = %.15g，但本地参数配置未保存', ...
+                char(variableName), confirmedValue);
+        end
+    end
+
+    function processErrorMessage(fields)
+        if numel(fields) ~= 3 || strlength(fields(2)) == 0 || ...
+                strlength(fields(3)) == 0
+            registerControlProtocolError('ERR 消息格式无效');
+            return;
+        end
+
+        variableName = fields(2);
+        errorCode = fields(3);
+        parameterIndex = findDspParameter(variableName);
+        state.commandErrorCount = state.commandErrorCount + 1;
+        if ~isempty(parameterIndex)
+            dspParameters.statuses(parameterIndex) = "写入失败";
+        end
+        if strcmp(state.pendingVariable, char(variableName))
+            clearPendingCommand();
+        end
+        updateDspParameterControls();
+        statusLabel.Text = sprintf('DSP 拒绝 %s: %s', ...
+            char(variableName), char(errorCode));
+    end
+
+    function registerControlProtocolError(message)
+        state.commandErrorCount = state.commandErrorCount + 1;
+        statusLabel.Text = ['控制协议异常: ' message];
     end
 
     function updatePlots()
@@ -959,6 +1510,154 @@ onRefreshPorts();
         physicalIndices = logicalToPhysical(1:state.sampleCount);
         orderedTime = state.time(physicalIndices);
         orderedValues = state.values(physicalIndices, :);
+    end
+
+    function parameters = defaultDspParameters()
+        parameters.names = ["V_REF", "I_REF", "KP_I", "KI_I"];
+        parameters.units = ["V", "A", "", ""];
+        parameters.minimums = [0, 0, 0, 0];
+        parameters.maximums = [100, 20, 10, 10000];
+        parameters.values = [75, 4.5, 0.015, 75];
+        parameters.confirmedValues = nan(size(parameters.values));
+        parameters.statuses = repmat("未发送", size(parameters.names));
+    end
+
+    function parameters = loadDspParameters()
+        parameters = defaultDspParameters();
+        try
+            if ~ispref(preferencesGroup, dspParameterPreferencesKey)
+                return;
+            end
+            storedParameters = getpref( ...
+                preferencesGroup, dspParameterPreferencesKey);
+            [validSettings, ~] = ...
+                isValidDspParameterSettings(storedParameters);
+            if ~validSettings
+                return;
+            end
+
+            parameters.names = reshape( ...
+                strtrim(string(storedParameters.names)), 1, []);
+            parameters.units = reshape( ...
+                strtrim(string(storedParameters.units)), 1, []);
+            parameters.minimums = reshape( ...
+                double(storedParameters.minimums), 1, []);
+            parameters.maximums = reshape( ...
+                double(storedParameters.maximums), 1, []);
+            parameters.values = reshape( ...
+                double(storedParameters.values), 1, []);
+            parameters.confirmedValues = nan(size(parameters.values));
+            parameters.statuses = repmat( ...
+                "未发送", size(parameters.names));
+        catch
+            parameters = defaultDspParameters();
+        end
+    end
+
+    function [valid, errorMessage] = isValidDspParameterSettings(parameters)
+        valid = false;
+        errorMessage = '';
+        requiredFields = {'names', 'units', 'minimums', ...
+            'maximums', 'values'};
+        if ~isstruct(parameters) || ...
+                ~all(isfield(parameters, requiredFields))
+            errorMessage = '参数配置缺少必要字段。';
+            return;
+        end
+
+        try
+            names = reshape(strtrim(string(parameters.names)), 1, []);
+            units = reshape(strtrim(string(parameters.units)), 1, []);
+            minimums = reshape(double(parameters.minimums), 1, []);
+            maximums = reshape(double(parameters.maximums), 1, []);
+            values = reshape(double(parameters.values), 1, []);
+        catch
+            errorMessage = '参数配置包含无法转换的数据。';
+            return;
+        end
+
+        parameterCount = numel(names);
+        if parameterCount < 1 || parameterCount > maxDspParameterCount
+            errorMessage = sprintf('DSP 参数数量必须在 1 到 %d 之间。', ...
+                maxDspParameterCount);
+            return;
+        end
+        if numel(units) ~= parameterCount || ...
+                numel(minimums) ~= parameterCount || ...
+                numel(maximums) ~= parameterCount || ...
+                numel(values) ~= parameterCount
+            errorMessage = '参数配置各字段的数量不一致。';
+            return;
+        end
+
+        validName = cellfun(@(name) ~isempty(regexp(name, ...
+            '^[A-Za-z_][A-Za-z0-9_]{0,31}$', 'once')), cellstr(names));
+        if any(~validName)
+            errorMessage = ['参数名称必须是 1～32 个字符的标识符，' ...
+                '只能包含字母、数字和下划线，且首字符不能是数字。'];
+            return;
+        end
+        if numel(unique(lower(names))) ~= parameterCount
+            errorMessage = '参数名称不能重复，大小写不同也视为重复。';
+            return;
+        end
+        if any(strlength(units) > 16) || ...
+                any(contains(units, newline)) || ...
+                any(contains(units, char(13)))
+            errorMessage = '单位不能包含换行，且长度不能超过 16 个字符。';
+            return;
+        end
+        if any(~isfinite(minimums)) || any(~isfinite(maximums)) || ...
+                any(~isfinite(values))
+            errorMessage = '当前值、最小值和最大值必须是有限数值。';
+            return;
+        end
+        if any(minimums >= maximums)
+            errorMessage = '每个参数的最小值必须小于最大值。';
+            return;
+        end
+        if any(values < minimums | values > maximums)
+            errorMessage = '当前设定值必须位于对应的最小值和最大值之间。';
+            return;
+        end
+        valid = true;
+    end
+
+    function value = numericDspParameterValue(inputValue)
+        if isnumeric(inputValue) && isscalar(inputValue)
+            value = double(inputValue);
+        elseif ischar(inputValue) || isstring(inputValue)
+            value = str2double(string(inputValue));
+        else
+            value = NaN;
+        end
+    end
+
+    function [saved, errorMessage] = saveDspParameterSettings()
+        storedParameters.names = cellstr(dspParameters.names);
+        storedParameters.units = cellstr(dspParameters.units);
+        storedParameters.minimums = dspParameters.minimums;
+        storedParameters.maximums = dspParameters.maximums;
+        storedParameters.values = dspParameters.values;
+        saved = false;
+        errorMessage = '';
+        try
+            setpref(preferencesGroup, dspParameterPreferencesKey, ...
+                storedParameters);
+            saved = true;
+        catch exception
+            errorMessage = exception.message;
+        end
+    end
+
+    function saveDspParameterSettingsWithAlert()
+        [saved, errorMessage] = saveDspParameterSettings();
+        if ~saved && ~isempty(state.dspParameterFigure) && ...
+                isvalid(state.dspParameterFigure)
+            uialert(state.dspParameterFigure, ...
+                ['参数修改已在本次运行中生效，但无法保存到 MATLAB 首选项。' ...
+                newline errorMessage], '保存参数失败');
+        end
     end
 
     function settings = defaultChannelSettings()
@@ -1338,6 +2037,9 @@ onRefreshPorts();
         state.serial = [];
         state.connected = false;
         state.paused = false;
+        clearPendingCommand();
+        dspParameters.confirmedValues(:) = NaN;
+        dspParameters.statuses(:) = "未发送";
 
         if isvalid(fig)
             connectButton.Text = '连接';
@@ -1352,12 +2054,14 @@ onRefreshPorts();
             pauseButton.FontColor = textColor;
             statusLamp.Color = [0.65 0.65 0.65];
             statusLabel.Text = message;
+            updateDspParameterControls();
         end
     end
 
     function onClose(~, ~)
         state.closing = true;
         closeChannelSettings();
+        closeDspParameterSettings();
         disconnectSerial('正在关闭');
         delete(fig);
     end
